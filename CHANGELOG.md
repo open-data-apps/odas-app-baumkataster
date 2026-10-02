@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.30.6 - 2026-10-02
+- ENH: Verwendete ODAS-Dienste in `odas-services` deklariert.
+
 ## 1.30.5 - 2026-09-10
 - **FIX:** README-Doku-Drift beseitigt: Einzelpunkte sind Canvas-Renderer, nicht WebGL/Leaflet.glify.
 
