@@ -1,4 +1,4 @@
-# Kommunaler Baumkataster – App für den Open Data App-Store (ODAS)
+# Baumkataster – App für den Open Data App-Store (ODAS)
 
 Die App **Baumkataster** bietet eine interaktive Visualisierung des kommunalen Baumbestands einer Stadt.
 
@@ -11,44 +11,39 @@ Mehr zu Open Data Apps unter https://github.com/open-data-apps
 
 ## Funktionen
 
-Die App ist eine Single Page Application (Webapp) mit:
+![Screenshot der Baumkataster-App](assets/Desktop_Screenshot.png)
 
-- Logo-Anzeige
-- Menü
-- Seiten für Impressum, Datenschutz, Beschreibung, Kontakt, Hauptinhalt
-- Inhaltsbereich
-- Fußzeile
+![Screenshot der Baumkataster-App 2](assets/Desktop_Screenshot_2.png)
 
-Die Konfiguration wird vom ODAS geladen. Die App zeigt folgende Inhalte:
+Single Page Application mit Logo, Menü, Impressum/Datenschutz/Kontakt-Seiten und Fußzeile. Die Konfiguration wird vom ODAS geladen. Inhalte:
 
 - **Kennzahlen**: Gesamtanzahl Bäume, Ø Baumalter, Ø Baumhöhe, Anzahl Stadtbezirke
-- **Top-15 Baumarten**: Horizontales Balkendiagramm der häufigsten Baumarten
-- **Pflanzungen pro Jahrzehnt**: Balkendiagramm der Neupflanzungen je Dekade
-- **Altersverteilung**: Histogramm der Bäume nach Standalter
-  - **Kartenansicht**: Interaktive Karte mit allen Baumstandorten (Leaflet.js, OpenStreetMap)
-    - **Heatmap** (farbige Dichtekarte, unbegrenzte Anzahl Bäume)
-    - **Einzelpunkte** (WebGL-basiert mit Leaflet.glify, performant für sehr große Datenmengen, Popup mit Details)
-    - Umschaltbar zwischen Heatmap und Einzelpunkten
-    - Automatische Filterung nach Stadtbezirk/Baumart wirkt auch auf die Karte
-- **Stadtbezirk-Filter**: Alle Auswertungen und Karte filterbar nach Stadtbezirk
-- **Baumart-Suche**: Freitextsuche zur Filterung nach Baumart
+- **Top-15 Baumarten**: Horizontales Balkendiagramm
+- **Pflanzungen pro Jahrzehnt**: Balkendiagramm je Dekade
+- **Altersverteilung**: Histogramm nach Standalter
+- **Kartenansicht**: Interaktive Karte (Leaflet.js/OpenStreetMap) mit Heatmap und Canvas-Einzelpunkten, umschaltbar; Filter wirken auf die Karte
+- **Stadtbezirk-Filter**, **Baumart-Dropdown**, **Baumart-Suche** (entprellt) und **Pflanzjahr-Spanne**
+- **Umkreissuche**: Nächste Bäume zum eigenen Standort (Geolocation, Tabelle nach Entfernung)
+- **CSV-Export** der gefilterten Ansicht; **Detailtabelle** (Top 500, sortierbar)
+- Datenquellen: ODS-Suche (API v2.1), CKAN-Tabellen und statische CSV/JSON-Dateien
+
+---
+
+## Für wen ist diese App?
+
+Diese App richtet sich an Bürgerinnen und Bürger der Kommune, an die Stadtverwaltung bzw. das Grünflächenamt sowie an alle, die sich für das Stadtgrün interessieren. Voraussetzung ist kein spezielles Datenwissen – wer wissen möchte, welche Bäume in der eigenen Umgebung stehen, kann die App direkt nutzen.
 
 ---
 
 ## Datenformat
 
-Die App unterstützt sowohl **JSON** als auch **CSV** als Datenquelle:
-
-- **JSON**: API-Endpunkt gibt ein Objekt mit `results`-Array zurück (z.B. OpenDataSoft `/records`-Endpunkt)
-- **CSV**: API-Endpunkt liefert Semikolon-separierte CSV-Datei (z.B. OpenDataSoft `/exports/csv`-Endpunkt)
-
-Die Erkennung erfolgt automatisch anhand der URL. CSV wird erkannt wenn die URL `/exports/csv` oder `delimiter=` enthält.
+Unterstützt **CSV** (Semikolon-separiert, z.B. OpenDataSoft `/exports/csv`-Endpunkt).
 
 ---
 
 ## Kompatible Datensätze
 
-Die App ist kompatibel mit kommunalen Baumkataster-Datensätzen, die folgende Kernfelder enthalten:
+Kommunale Baumkataster-Datensätze mit folgenden Kernfeldern (Feldnamen per Konfiguration anpassbar):
 
 | Schema-Feld        | Beschreibung         | Dortmund-Beispiel |
 | ------------------ | -------------------- | ----------------- |
@@ -60,32 +55,17 @@ Die App ist kompatibel mit kommunalen Baumkataster-Datensätzen, die folgende Ke
 | `baumhoehe_m`      | Baumhöhe in Metern   | `baumhoehe`       |
 | `stadtbezirk_name` | Stadtbezirk          | `stadtbezbe`      |
 
-Die Feldnamen können in der Instanz-Konfiguration der App angepasst werden.
-
 ---
 
 ## Entwicklung
 
-### Systemvoraussetzungen
-
-- Docker / Docker Compose
-- Make
-
-Die Entwicklung wurde getestet unter Windows und Ubuntu.
-
-### Starten
+**Voraussetzungen:** Docker / Docker Compose, Make
 
 ```bash
 make build up
 ```
 
-Die App wird gestartet und steht auf Port 8089 zur Verfügung: http://localhost:8089
-
-Weil die App mit localhost gestartet wird, wird die Konfiguration lokal geladen.
-
-### Aufbau der App
-
-Der Inhaltsbereich wird in `app.js` erstellt. Dort ist die gesamte Visualisierungslogik implementiert.
+App läuft auf http://localhost:8089 (Konfiguration wird lokal geladen).
 
 ### Wichtige Dateien
 
@@ -99,31 +79,70 @@ Der Inhaltsbereich wird in `app.js` erstellt. Dort ist die gesamte Visualisierun
 
 ---
 
-## Kartenfunktion
-
-Die App verwendet [Leaflet.js](https://leafletjs.com/), [Leaflet.heat](https://github.com/Leaflet/Leaflet.heat) und [Leaflet.glify](https://github.com/robertleeplummerjr/Leaflet.glify) für die performante Darstellung aller Baumstandorte – unabhängig von der Anzahl – als Heatmap oder Einzelpunkte. Die Einzelpunktdarstellung nutzt WebGL für maximale Performance auch bei sehr großen Datensätzen (z.B. >100.000 Bäume). Die Karte nutzt OpenStreetMap-Kacheln und benötigt keinen API-Key. Die Ansicht kann zwischen Heatmap und Einzelpunkten umgeschaltet werden. Die Filter (Bezirk, Baumart) wirken direkt auf die Karte.
-
-**Hinweis:** Dank WebGL (Leaflet.glify) können alle Einzelpunkte auch bei sehr großen Datensätzen flüssig dargestellt werden.
-
 ## Konfiguration (Instanz)
-
-Folgende Parameter werden bei der App-Instanzierung im ODAS konfiguriert:
 
 | Parameter          | Beschreibung                                      | Pflicht |
 | ------------------ | ------------------------------------------------- | ------- |
-| `apiurl`           | URL zum JSON- oder CSV-Endpunkt der Baudaten      | ja      |
+| `apiurls`          | URLs zu Datenressourcen. Eintrag `baeume`: URL zum JSON- oder CSV-Endpunkt der Baumdaten | ja (Eintrag `baeume`) |
 | `urlDaten`         | URL zur Katalog-Seite des Datensatzes im ODP      | ja      |
-| `stadtbezirk-feld` | Feldname für Stadtbezirk im Quelldatensatz        | ja      |
-| `baumart-feld`     | Feldname für deutschen Artnamen im Quelldatensatz | ja      |
-| `pflanzjahr-feld`  | Feldname für Pflanzjahr im Quelldatensatz         | ja      |
-| `baumhoehe-feld`   | Feldname für Baumhöhe im Quelldatensatz           | nein    |
-| `standalter-feld`  | Feldname für Standalter im Quelldatensatz         | nein    |
+| `stadtbezirk-feld` | Feldname für Stadtbezirk im Quelldatensatz; leer = automatische Erkennung | nein    |
+| `baumart-feld`     | Feldname für deutschen Artnamen im Quelldatensatz; leer = automatische Erkennung | nein    |
+| `pflanzjahr-feld`  | Feldname für Pflanzjahr im Quelldatensatz; leer = automatische Erkennung | nein    |
+| `baumhoehe-feld`   | Feldname für Baumhöhe im Quelldatensatz; leer = automatische Erkennung | nein    |
+| `standalter-feld`  | Feldname für Standalter im Quelldatensatz; leer = automatische Erkennung | nein    |
 | `titel`            | Anzeigetitel der App                              | ja      |
 | `seitentitel`      | Browser-Tab-Titel                                 | ja      |
 
-Was bei der App-Entwicklung beachtet werden sollte, steht in der ODA-Spezifikation.
-
 ---
+
+## Betriebsarten
+
+Die App kann lokal, eigenstaendig hinter einem Traefik-Reverse-Proxy oder ueber den ODAS
+betrieben werden.
+
+### Datenabruf: `proxyAktiv`
+
+| Wert   | Bedeutung                                                                   |
+| ------ | --------------------------------------------------------------------------- |
+| `nein` | Direkter Abruf der Daten-URL. Standard fuer Entwicklung und Standalone.      |
+| `ja`   | Abruf ueber den ODAS-Proxy `…/odp-data`. Nur im ODAS-Live-System verfuegbar. |
+
+Bei `nein` muss die Datenquelle CORS freigeben.
+
+### Standalone-Betrieb
+
+Voraussetzung: ein laufender Traefik mit dem externen Docker-Netzwerk `proxynet`,
+dem EntryPoint `websecure` und dem Zertifikatsresolver `letsencrypt`.
+
+1. In `docker-compose.standalone.yml` den Platzhalter `app1.example.com` durch den
+   echten FQDN ersetzen.
+2. In `odas-config/config.json` `proxyAktiv` auf `nein` belassen.
+3. Starten:
+
+```bash
+STANDALONE=true make up
+STANDALONE=true make logs
+STANDALONE=true make down
+```
+
+Im Standalone-Betrieb entfaellt die lokale Portfreigabe; Traefik terminiert TLS und
+leitet auf den internen Nginx-Port 80 weiter. Die Konfiguration wird aus derselben
+`odas-config/config.json` gelesen wie in der Entwicklung und von Nginx unter `/config`
+ausgeliefert.
+
+### Beim Aufruf kontaktierte Drittanbieter
+
+Beim Aufruf dieser App werden folgende externe Server kontaktiert:
+
+- `tile.openstreetmap.org` — Kartenkacheln (OpenStreetMap)
+
+Diese Anbieter bleiben auch im Standalone-Betrieb extern; ein vollständig autarker Betrieb ohne Internetzugang ist derzeit nicht möglich. Alle Programmbibliotheken werden lokal aus `app/vendor/` ausgeliefert und nicht mehr extern geladen.
+
+### Auslieferung an den ODAS
+
+`make zip` erzeugt das Liefer-ZIP mit `app/`, `assets/`, `app-package.json` und
+`CHANGELOG.md`. Die Infrastrukturdateien (`Dockerfile`, `docker-compose*.yml`,
+`nginx.conf`, `Makefile`) sind nicht Teil der Auslieferung. Das ZIP ist ein Bauartefakt und wird nicht mitversioniert, sondern bei Bedarf mit `make zip` erzeugt.
 
 ## Autor
 

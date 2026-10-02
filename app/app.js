@@ -10,32 +10,375 @@
  *  - CSV (Semikolon-getrennt, via /exports/csv)
  *
  * ConfigData (JSON) enthält:
- *   apiurl  : "https://...",  // URL zur JSON/CSV-Ressource (Pflicht)
+ *   apiurls : [{ name: "baeume", label: "...", url: "https://..." }], // Pflicht
  *   titel   : "Baumkataster", // optional
- *   limit   : 5000            // optional, max. Datensätze laden (default 5000)
  */
+function isOdasProxyEnabled(configdata = {}) {
+  return String(configdata.proxyAktiv || "").trim().toLowerCase() === "ja";
+}
+
+function extractPathFromUrl(url) {
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.pathname + parsedUrl.search;
+  } catch (_error) {
+    return String(url || "");
+  }
+}
+
+function getOdasAppBasePath(pathname) {
+  let appPath =
+    pathname === undefined
+      ? typeof window !== "undefined"
+        ? window.location.pathname
+        : "/"
+      : String(pathname || "/");
+
+  if (!appPath.endsWith("/")) {
+    const lastSlashIndex = appPath.lastIndexOf("/");
+    const lastSegment = appPath.substring(lastSlashIndex + 1);
+    if (lastSegment.includes(".")) {
+      appPath = appPath.substring(0, lastSlashIndex + 1);
+    }
+  }
+
+  return appPath.replace(/\/+$/, "");
+}
+
+function getOdasProxyEndpoint(targetUrl, pathname) {
+  const appPath = getOdasAppBasePath(pathname);
+  return `${appPath}/odp-data?path=${encodeURIComponent(targetUrl)}`;
+}
+
+async function fetchViaOdasProxy(targetUrl, options = {}) {
+  if (typeof isKeineDatenquelleKonfiguriert === "function" && isKeineDatenquelleKonfiguriert(targetUrl)) {
+    throw new Error("Keine Datenquelle konfiguriert.");
+  } else if (typeof isKeineDatenquelleKonfiguriert !== "function") {
+    const v = String(targetUrl || "").trim();
+    if (!v || /^\{\{.*\}\}$/.test(v) || /^<.*>$/.test(v)) throw new Error("Keine Datenquelle konfiguriert.");
+  }
+
+  const response = await fetch(getOdasProxyEndpoint(targetUrl), {
+    method: "POST",
+    signal: options && options.signal ? options.signal : undefined,
+  });
+
+  if (!response.ok) {
+    let body = "";
+    try {
+      body = await response.text();
+    } catch (_e) {}
+    const originHint = /origin not allowed/i.test(body) ? " – URL origin not allowed" : "";
+    throw new Error(`ODAS-Proxy-Fehler: HTTP ${response.status}${originHint}`);
+  }
+
+  const proxyData = await response.json();
+  if (!proxyData || typeof proxyData.content !== "string") {
+    throw new Error("ODAS-Proxy-Antwort enthält keinen content-String.");
+  }
+
+  return proxyData.content;
+}
+
+async function fetchOdasResource(targetUrl, configdata = {}) {
+  if (isOdasProxyEnabled(configdata)) {
+    return fetchViaOdasProxy(targetUrl);
+  }
+
+  try {
+    const response = await fetch(targetUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.text();
+  } catch (error) {
+    throw new Error(
+      `Direkter Datenabruf fehlgeschlagen (${error.message}). Bitte prüfen Sie die Daten-URL und die CORS-Freigabe der Datenquelle.`,
+    );
+  }
+}
+
+/**
+ * Löst eine benannte Datenressource aus configdata.apiurls auf.
+ * Neue apiurls-Form (typ: "array"); das frühere skalare apiurl wird nicht mehr gelesen.
+ * @returns {string} getrimmte URL, oder "" für den Zustand "keine Quelle konfiguriert"
+ */
+function getOdasApiUrl(configdata, name) {
+  const liste = Array.isArray(configdata && configdata.apiurls) ? configdata.apiurls : [];
+  const treffer = liste.find((eintrag) => eintrag && eintrag.name === name);
+  return String((treffer && treffer.url) || "").trim();
+}
+
+async function fetchOdasJson(targetUrl, configdata = {}) {
+  const rawContent = await fetchOdasResource(targetUrl, configdata);
+  try {
+    return JSON.parse(rawContent);
+  } catch (_error) {
+    throw new Error(
+      `Die konfigurierte Daten-URL liefert kein JSON, sondern ${describeNonJsonPayload(rawContent)}. ` +
+        "Bitte in der Instanzkonfiguration den API-Endpunkt der Datenquelle eintragen, " +
+        "nicht den Datensatz- oder Download-Link.",
+    );
+  }
+}
+
+function describeNonJsonPayload(rawContent) {
+  const text = String(rawContent == null ? "" : rawContent).trim();
+  if (!text) return "eine leere Antwort";
+  if (text.startsWith("<")) return "eine HTML-Seite";
+  const firstLine = text.split(/\r?\n/, 1)[0];
+  if (/[,;]/.test(firstLine)) return "eine CSV- oder Textdatei";
+  return "unlesbaren Inhalt";
+}
+
+function isKeineDatenquelleKonfiguriert(targetUrl) {
+  const quelle = String(targetUrl || "").trim();
+  return !quelle || /^\{\{.*\}\}$/.test(quelle) || /^<.*>$/.test(quelle);
+}
+
+
+const TYP_BEZEICHNUNG = {
+  "ckan-dkan-ds": "Tabellen-API mit Daten-ID",
+  "ckan-ps": "Datensatz-API",
+  "ckan-dl": "Datei-Download",
+  "ods21": "Open-Data-Suche (API v2.1)",
+  "wfs": "Kartendienst (WFS)",
+  "sparql": "Wissensdatenbank (SPARQL)",
+  "csv-zip": "Statische Datei"
+};
+
+function validateUrlTypErwartung(url, erwarteterTyp) {
+  const u = String(url || "");
+  if (!erwarteterTyp || isKeineDatenquelleKonfiguriert(u)) return null;
+  const checks = {
+    "ckan-dkan-ds": /\/api\/3\/action\/datastore_search\?resource_id=/i,
+    "ckan-ps": /\/api\/3\/action\/package_show\?id=/i,
+    "ckan-dl": /\/dataset\/.*\/resource\/.*\/download\//i,
+    "ods21": /\/api\/explore\/v2\.1\//i,
+    "wfs": /service=WFS/i,
+    "sparql": /\/api\/ts\/v1\/kg\/sparql/i,
+    "csv-zip": /\.(csv|json|zip)(\?|$)/i
+  };
+  const re = checks[erwarteterTyp];
+  if (!re) return null;
+  if (!re.test(u)) {
+    const soll = TYP_BEZEICHNUNG[erwarteterTyp] || erwarteterTyp;
+    return `Typ passt nicht: erwartet „${soll}", erhalten „${u.slice(0, 60)}…". Prüfen Sie den Hilfe-Tooltip bei „URLs zu Datenressourcen".`;
+  }
+  return null;
+}
+
+function classifyOdasFehler(error, kontext = {}) {
+  const msg = String((error && error.message) || error || "");
+  const url = String(kontext.url || "");
+  const label = String(kontext.label || "Datenressource");
+  const typLabel = String(kontext.typLabel || TYP_BEZEICHNUNG[kontext.erwarteterTyp] || "Datenquelle");
+  if (/Keine Datenquelle konfiguriert/i.test(msg) || isKeineDatenquelleKonfiguriert(url)) {
+    return {
+      kind: "KEINE_QUELLE",
+      titel: "Es ist keine Datenquelle konfiguriert.",
+      hinweis: `Prüfen Sie unter „URLs zu Datenressourcen → ${label}" ob eine gültige ${typLabel}-URL eingetragen ist (Hilfe-Tooltip beachten).`,
+      detail: msg,
+      alertClass: "alert-info"
+    };
+  }
+  if (/Typ passt nicht: erwartet/i.test(msg)) {
+    return {
+      kind: "TYP_MISMATCH",
+      titel: msg,
+      hinweis: `Diese App erwartet ${typLabel}. Korrigieren Sie die URL gemäß Hilfe-Tooltip (Beispiel dort).`,
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/URL origin not allowed/i.test(msg)) {
+    return {
+      kind: "PROXY_ORIGIN",
+      titel: "ODAS-Proxy blockiert: Ziel-Origin nicht freigegeben.",
+      hinweis: "Tragen Sie die Ziel-Origin als eigenen Eintrag unter „URLs zu Datenressourcen“ ein oder prüfen Sie proxyAktiv.",
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/ODAS-Proxy-Fehler/i.test(msg) || /kein content-String/i.test(msg)) {
+    return {
+      kind: "PROXY_HTTP",
+      titel: msg,
+      hinweis: "Prüfen Sie proxyAktiv und Erreichbarkeit im ODAS-Live-System (lokal 404 ist normal).",
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/Direkter Datenabruf fehlgeschlagen/i.test(msg) || /Failed to fetch/i.test(msg)) {
+    const corsHint = /Failed to fetch/i.test(msg) ? " – vermutlich CORS blockiert → im ODAS-Live proxyAktiv=ja." : "";
+    return {
+      kind: "DIREKT_CORS_HTTP",
+      titel: msg,
+      hinweis: `Prüfen Sie URL und CORS der Quelle${corsHint}`,
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/liefert kein JSON/i.test(msg) || /HTML-Seite|CSV-|leere Antwort|unlesbaren/i.test(msg)) {
+    return {
+      kind: "PAYLOAD_TYP",
+      titel: msg,
+      hinweis: "Tragen Sie den passenden Endpunkt ein – nicht die Datensatzseite (/dataset/…) – Hilfe-Tooltip beachten.",
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/CKAN.*Fehler|success:false/i.test(msg)) {
+    return {
+      kind: "CKAN_API",
+      titel: msg,
+      hinweis: "Prüfen Sie Daten-ID / Datensatz-ID (existiert die Tabelle/Datei noch auf dem Portal?).",
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  if (/404|Nicht gefunden/i.test(msg)) {
+    return {
+      kind: "HTTP_404",
+      titel: msg,
+      hinweis: "Ressource/Datensatz auf dem Portal nicht gefunden (404).",
+      detail: msg,
+      alertClass: "alert-danger"
+    };
+  }
+  return {
+    kind: "UNBEKANNT",
+    titel: msg || "Unbekannter Fehler beim Laden.",
+    hinweis: "Prüfen Sie Konfiguration und Erreichbarkeit der Quelle.",
+    detail: msg,
+    alertClass: "alert-danger"
+  };
+}
+
+// Top-Level-Variante: renderOdasFehler laeuft ausserhalb von app() und darf
+// nicht auf das nested escapeHtml (innerhalb app()) angewiesen sein. Innerhalb
+// von app() schattiert die dortige Funktion diese Deklaration.
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function renderOdasFehler(container, error, kontext = {}) {
+  if (!container) return;
+  // Mehrere akzeptierte URL-Typen (z. B. ODS-Suche, CKAN-Tabelle oder
+  // statische Datei): erst warnen, wenn kein einziger passt.
+  const typen = Array.isArray(kontext.erwarteteTypen) && kontext.erwarteteTypen.length
+    ? kontext.erwarteteTypen
+    : [kontext.erwarteterTyp];
+  let typWarn = null;
+  for (const t of typen) {
+    typWarn = validateUrlTypErwartung(kontext.url, t);
+    if (!typWarn) break;
+  }
+  if (typWarn && !/Typ passt nicht/i.test(String(error && error.message))) {
+    error = new Error(typWarn);
+  }
+  const info = classifyOdasFehler(error, kontext);
+  const url = String(kontext.url || "");
+  const urlZeile = url ? `<p class="mb-1 small text-muted">Konfigurierte URL: <code>${escapeHtml(url.length > 80 ? url.slice(0, 80) + "…" : url)}</code></p>` : "";
+  const titel = kontext.leer ? "Keine Datensätze gefunden." : info.titel;
+  const alertClass = kontext.leer ? "alert-info" : info.alertClass;
+  container.innerHTML = `<div class="alert ${alertClass}" role="alert"><strong>${escapeHtml(titel)}</strong><p class="mb-1">${escapeHtml(info.hinweis)}</p>${urlZeile}<details class="small"><summary>Details</summary><code>${escapeHtml(info.detail || String(error))}</code></details></div>`;
+}
+
+function isLeerErgebnis(json) {
+  if (!json) return true;
+  if (Array.isArray(json) && json.length === 0) return true;
+  if (Array.isArray(json.records) && json.records.length === 0) return true;
+  if (Array.isArray(json.results) && json.results.length === 0) return true;
+  if (json.result && Array.isArray(json.result.records) && json.result.records.length === 0) return true;
+  return false;
+}
+
+
+// PapaParse (CSV-Parsing) dynamisch aus app/vendor laden; Promise-basiert.
+function ensurePapaparse() {
+  return new Promise((resolve, reject) => {
+    if (window.Papa) {
+      resolve();
+      return;
+    }
+    const vorhanden = document.getElementById("papaparse-script");
+    if (vorhanden) {
+      vorhanden.addEventListener("load", () => resolve());
+      vorhanden.addEventListener("error", () =>
+        reject(new Error("PapaParse konnte nicht geladen werden.")),
+      );
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = "papaparse-script";
+    script.src = "vendor/papaparse/papaparse.min.js";
+    script.onload = () => resolve();
+    script.onerror = () =>
+      reject(new Error("PapaParse konnte nicht geladen werden."));
+    document.head.appendChild(script);
+  });
+}
+
+let bkInstanzZaehler = 0;
+
+// F-51: Container -> Teardown-Callback. Die Karte lebt in der Closure von
+// renderContent(); deshalb registriert sie dort ihre eigene Abbaufunktion.
+const baumTeardowns = new Map();
+
+// BK-B4: Datencache pro Container (statt global pro URL). Gleicher Nutzen bei
+// Same-Page-Re-Render, aber instanzgetrennt und ohne ewige Global-Ablage.
+// Eintrag: { url, records, freshnessLabel, ladeHinweis }.
+const bkDatenCache = new Map();
+
+/* Wird von app/app-base.js zu Beginn von loadPage() aufgerufen. */
+function onPageLeave(page) {
+  baumTeardowns.forEach((teardown, container) => {
+    try {
+      teardown();
+    } catch (error) {
+      console.warn("Fehler beim Abraeumen der Baumkataster-Instanz:", error);
+    }
+    baumTeardowns.delete(container);
+  });
+}
+
 function app(configdata, enclosingHtmlDivElement) {
+  const bkUid = "i" + ++bkInstanzZaehler;
+  const root = enclosingHtmlDivElement;
+  // F-57: Früher disposed-State. renderApp wird erst nach dem Daten- und
+  // Chart.js-Load aufgerufen; ein Seitenwechsel davor darf die späten
+  // .then-/ensureChartJsLoaded-Fortsetzungen nicht mehr rendern lassen.
+  // Der frühe Teardown-Eintrag wird von renderApp mit dem vollständigen
+  // Abbau überschrieben, sobald die Ressourcenclosure existiert.
+  let disposed = false;
+  // BK-B1: vorherigen (ggf. vollständigen) Teardown desselben Containers
+  // zuerst laufen lassen — sonst leakt bei Same-Page-Re-Render die alte
+  // Leaflet-Karte samt Charts.
+  const bkVorherigerTeardown = baumTeardowns.get(enclosingHtmlDivElement);
+  if (bkVorherigerTeardown) {
+    try {
+      bkVorherigerTeardown();
+    } catch (_e) {}
+  }
+  baumTeardowns.set(enclosingHtmlDivElement, function () {
+    disposed = true;
+  });
   // ── Fortschrittsbalken-CSS und Ladebereich-HTML ──────────────────────────
+  // Ladeanzeige: Klassen statt IDs (mehrere Instanzen), Styles in app.css.
   function renderContent(container) {
     container.innerHTML = `
-      <style>
-        #lade-container { margin: 40px auto; max-width: 500px; text-align: center; color: #212529; font-size: 0.95rem; }
-        #lade-balken-wrapper { background: #e9ecef; border-radius: 8px; overflow: hidden; height: 12px; margin: 16px 0 10px; border: 1px solid #dee2e6; }
-        #lade-balken { height: 100%; width: 0%; background: linear-gradient(90deg, #00bcd4, #4caf50); border-radius: 8px; transition: width 0.3s ease; }
-        #lade-text { font-size: 0.85rem; color: #212529; }
-        @keyframes pulsieren {
-          0%   { width: 20%; margin-left: 0%; }
-          50%  { width: 40%; margin-left: 50%; }
-          100% { width: 20%; margin-left: 0%; }
-        }
-        #lade-balken.unbekannt { animation: pulsieren 1.5s ease-in-out infinite; }
-      </style>
-      <div id="lade-container">
-        <div style="font-size:1.1rem; margin-bottom:8px;">🌳 Baumdaten werden geladen…</div>
-        <div id="lade-balken-wrapper">
-          <div id="lade-balken"></div>
+      <div class="bk-lade-container">
+        <div class="bk-lade-titel">🌳 Baumdaten werden geladen…</div>
+        <div class="bk-lade-balken-wrapper">
+          <div class="bk-lade-balken"></div>
         </div>
-        <div id="lade-text">Verbinde mit Datenquelle…</div>
+        <div class="bk-lade-text">Verbinde mit Datenquelle…</div>
       </div>
     `;
   }
@@ -43,21 +386,25 @@ function app(configdata, enclosingHtmlDivElement) {
   // ── CSV mit Streaming und Fortschritt laden ──────────────────────────────
   async function loadCsvWithProgress(url) {
     let totalCount = 0;
-    try {
-      // Basis-URL extrahieren (bis zum ersten ?)
-      const baseUrl = url.split("?")[0];
-      // Dataset-Pfad: /exports/csv → /records
-      const recordsBase = baseUrl.replace("/exports/csv", "/records");
-      const metaUrl = recordsBase + "?limit=1";
-      const meta = await fetch(metaUrl).then((r) => r.json());
-      totalCount = meta.total_count || 0;
-    } catch (e) {
-      console.warn("Meta-Request fehlgeschlagen:", e);
+    // Meta-Request nur für ODS-CSV-Exporte — bei statischen Dateien gäbe es
+    // sonst eine sinnlose Zusatzanfrage (fetchOdasJson beachtet proxyAktiv).
+    if (String(url || "").toLowerCase().includes("/exports/csv")) {
+      try {
+        // Basis-URL extrahieren (bis zum ersten ?)
+        const baseUrl = url.split("?")[0];
+        // Dataset-Pfad: /exports/csv → /records
+        const recordsBase = baseUrl.replace("/exports/csv", "/records");
+        const metaUrl = recordsBase + "?limit=1";
+        const meta = await fetchOdasJson(metaUrl, configdata);
+        totalCount = meta.total_count || 0;
+      } catch (e) {
+        console.warn("Meta-Request fehlgeschlagen:", e);
+      }
     }
 
     // Fortschritt initialisieren
-    const balken = document.getElementById("lade-balken");
-    const text = document.getElementById("lade-text");
+    const balken = root.querySelector(".bk-lade-balken");
+    const text = root.querySelector(".bk-lade-text");
     if (totalCount > 0) {
       if (text)
         text.textContent = `0 von ${totalCount.toLocaleString("de-DE")} Zeilen geladen (0 %)`;
@@ -66,7 +413,16 @@ function app(configdata, enclosingHtmlDivElement) {
       if (text) text.textContent = "Daten werden geladen…";
     }
 
+    // Ueber den ODAS-Proxy gibt es keinen Streaming-Body, also ohne Fortschritt laden.
+    if (isOdasProxyEnabled(configdata)) {
+      const csvText = await fetchViaOdasProxy(url);
+      if (text) text.textContent = "Daten geladen";
+      if (balken) balken.style.width = "100%";
+      return { csvText, freshnessLabel: extractDatenStand(null, null) };
+    }
+
     const response = await fetch(url);
+    const freshnessLabel = extractDatenStand(null, response.headers.get("Last-Modified"));
     const contentLength = response.headers.get("Content-Length");
     const totalBytes = contentLength ? parseInt(contentLength) : 0;
 
@@ -116,19 +472,62 @@ function app(configdata, enclosingHtmlDivElement) {
     if (text)
       text.textContent = `${totalCount > 0 ? totalCount.toLocaleString("de-DE") : "Alle"} Zeilen geladen ✓`;
 
-    return csvText;
+    return { csvText, freshnessLabel };
   }
 
   // ── Haupteinstieg ────────────────────────────────────────────────────────
-  const apiUrl = configdata.apiurl || configdata.apiUrl;
+  const apiUrl = getOdasApiUrl(configdata, "baeume");
   const appTitel = configdata.titel || "Baumkataster";
-  const maxLimit = configdata.limit || 5000;
 
-  if (!apiUrl) {
-    enclosingHtmlDivElement.innerHTML = `
-      <div class="alert alert-warning mt-4">
-        <strong>Konfigurationsfehler:</strong> Keine API-URL angegeben. de>apiurl</code> fehlt in der config.json.
-      </div>`;
+  // BK-B3: auch unaufgelöste {{...}}/<>-Platzhalter als „keine Quelle" zeigen
+  // statt sie zu fetchen.
+  if (isKeineDatenquelleKonfiguriert(apiUrl)) {
+    renderOdasFehler(
+      enclosingHtmlDivElement,
+      new Error("Keine Datenquelle konfiguriert."),
+      {
+        url: apiUrl,
+        label: "Baumkataster-API",
+        typLabel: "Open-Data-Suche (API v2.1)",
+        erwarteteTypen: ["ods21", "ckan-dkan-ds", "csv-zip"],
+      },
+    );
+    return null;
+  }
+
+  // Variante A (F-92): Typprüfung vor dem ersten Fetch. BK-B2: neben der
+  // ODS-Suche sind CKAN-Tabellen und statische Dateien zulässig — die Parser
+  // dahinter (parseResponse-Zweige, parseCsv) existieren längst.
+  const bkOdsWarn = validateUrlTypErwartung(apiUrl, "ods21");
+  const bkCkanWarn = bkOdsWarn ? validateUrlTypErwartung(apiUrl, "ckan-dkan-ds") : null;
+  const bkTypWarn = bkCkanWarn && validateUrlTypErwartung(apiUrl, "csv-zip") ? bkOdsWarn : null;
+  if (bkTypWarn) {
+    renderOdasFehler(enclosingHtmlDivElement, new Error(bkTypWarn), {
+      url: apiUrl,
+      label: "Baumkataster-API",
+      typLabel: "Open-Data-Suche (API v2.1)",
+      erwarteteTypen: ["ods21", "ckan-dkan-ds", "csv-zip"],
+    });
+    return null;
+  }
+
+  // Falls gecachte Daten desselben Containers zur selben URL vorhanden sind,
+  // direkt rendern (Same-Page-Re-Render ohne Re-Fetch).
+  const cachedEntry = bkDatenCache.get(enclosingHtmlDivElement);
+  const cachedRecords = cachedEntry && cachedEntry.url === apiUrl ? cachedEntry.records : null;
+  const cachedFreshnessLabel = cachedRecords ? cachedEntry.freshnessLabel || "" : "";
+  const cachedLadeHinweis = cachedRecords ? cachedEntry.ladeHinweis || "" : "";
+  if (cachedRecords && cachedRecords.length > 0) {
+    ensureChartJsLoaded(() => {
+      if (disposed) return;
+      renderApp(
+        cachedRecords,
+        enclosingHtmlDivElement,
+        appTitel,
+        cachedFreshnessLabel,
+        cachedLadeHinweis,
+      );
+    });
     return null;
   }
 
@@ -150,40 +549,72 @@ function app(configdata, enclosingHtmlDivElement) {
     const script = document.createElement("script");
     script.id = "chartjs-script";
     script.src =
-      "https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js";
+      "vendor/chartjs/chart.umd.min.js";
     script.onload = callback;
     script.onerror = () => {
+      if (disposed) return;
       enclosingHtmlDivElement.innerHTML = `<div class="alert alert-danger mt-4">Chart.js konnte nicht geladen werden.</div>`;
     };
     document.head.appendChild(script);
   }
 
   // Daten laden und nach Chart.js-Load rendern
-  loadAllRecords(apiUrl, maxLimit)
-    .then((records) => {
-      if (!records || records.length === 0)
-        throw new Error("Keine Datensätze gefunden.");
+  loadAllRecords(apiUrl)
+    .then((loadResult) => {
+      if (disposed) return;
+      const records = Array.isArray(loadResult) ? loadResult : loadResult.records;
+      const freshnessLabel = Array.isArray(loadResult)
+        ? ""
+        : loadResult.freshnessLabel || "";
+      const ladeHinweis = Array.isArray(loadResult)
+        ? ""
+        : loadResult.ladeHinweis || "";
+      if (!records || records.length === 0) {
+        enclosingHtmlDivElement.innerHTML = `
+          <div class="alert alert-info mt-4" role="alert">
+            Keine Datensätze in der Datenquelle gefunden.
+          </div>`;
+        return;
+      }
+      
+      // Daten pro Container cachen (BK-B4) — Re-Render ohne Re-Fetch.
+      bkDatenCache.set(enclosingHtmlDivElement, {
+        url: apiUrl,
+        records,
+        freshnessLabel,
+        ladeHinweis,
+      });
+
       ensureChartJsLoaded(() => {
-        renderApp(records, enclosingHtmlDivElement, appTitel);
+        if (disposed) return;
+        renderApp(
+          records,
+          enclosingHtmlDivElement,
+          appTitel,
+          freshnessLabel,
+          ladeHinweis,
+        );
         // Ladebereich ausblenden
-        const ladeContainer = document.getElementById("lade-container");
+        const ladeContainer = root.querySelector(".bk-lade-container");
         if (ladeContainer) ladeContainer.remove();
       });
     })
     .catch((err) => {
-      enclosingHtmlDivElement.innerHTML = `
-        <div class="alert alert-danger mt-4">
-          <strong>Fehler beim Laden der Daten:</strong> ${escapeHtml(err.message)}
-          <hr>URL: de>${escapeHtml(apiUrl)}</code>
-        </div>`;
+      if (disposed) return;
+      renderOdasFehler(enclosingHtmlDivElement, err, {
+        url: apiUrl,
+        label: "Baumkataster-API",
+        typLabel: "Open-Data-Suche (API v2.1)",
+        erwarteteTypen: ["ods21", "ckan-dkan-ds", "csv-zip"],
+      });
     });
 
   return null;
 
   // ── Fortschrittsbalken-Hilfsfunktion ────────────────────────────────────
   function updateProgress(geladen, gesamt, seitenNr) {
-    const balken = document.getElementById("lade-balken");
-    const text = document.getElementById("lade-text");
+    const balken = root.querySelector(".bk-lade-balken");
+    const text = root.querySelector(".bk-lade-text");
     if (!balken || !text) return;
     const pct =
       gesamt > 0 ? Math.min(100, Math.round((geladen / gesamt) * 100)) : 0;
@@ -196,29 +627,41 @@ function app(configdata, enclosingHtmlDivElement) {
   }
 
   // ── DATEN LADEN (paginiert / CSV) ────────────────────────────────────────
-  async function loadAllRecords(apiUrl, maxLimit) {
+  async function loadAllRecords(apiUrl) {
     const PAGE_SIZE = 100;
+    // BK-B5: Notbremse gegen Endlos-Pagination (Quelle ohne total_count, die
+    // ewig nicht-leere Seiten liefert). Name bewusst ohne „LIMIT“-Historie.
+    const BK_MAX_SEITEN = 500;
     let allRecords = [];
     let offset = 0;
     let seite = 1;
 
     const urlLower = apiUrl.toLowerCase();
     const isCsv =
-      urlLower.includes("/exports/csv") || urlLower.includes("delimiter=");
+      urlLower.includes("/exports/csv") ||
+      urlLower.includes("delimiter=") ||
+      /\.csv(\?|#|$)/.test(urlLower);
 
     if (isCsv) {
       let csvUrl = apiUrl;
       if (!/[?&]limit=/.test(csvUrl)) {
         csvUrl += (csvUrl.includes("?") ? "&" : "?") + "limit=-1";
       }
-      const csvText = await loadCsvWithProgress(csvUrl);
-      return parseCsv(csvText);
+      const csvResult = await loadCsvWithProgress(csvUrl);
+      await ensurePapaparse();
+      return {
+        records: parseCsv(csvResult.csvText),
+        freshnessLabel: csvResult.freshnessLabel,
+        ladeHinweis: "",
+      };
     }
 
     // JSON Pagination
-    const resp = await fetch(buildUrl(apiUrl, PAGE_SIZE, offset));
-    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
-    const firstJson = await resp.json();
+    const firstJson = await fetchOdasJson(
+      buildUrl(apiUrl, PAGE_SIZE, offset),
+      configdata,
+    );
+    const freshnessLabel = extractDatenStand(firstJson, null);
     const {
       records: firstBatch,
       totalCount,
@@ -229,29 +672,70 @@ function app(configdata, enclosingHtmlDivElement) {
     updateProgress(allRecords.length, totalCount || 0, seite);
     seite++;
 
-    if (
-      isOdsSingle ||
-      totalCount === null ||
-      allRecords.length >= Math.min(totalCount, maxLimit)
-    ) {
+    let ladeHinweis = "";
+
+    if (isOdsSingle) {
       updateProgress(allRecords.length, totalCount || 0, seite);
-      return normalizeRecords(allRecords);
+      return {
+        records: normalizeRecords(allRecords),
+        freshnessLabel,
+        ladeHinweis,
+      };
     }
 
-    while (allRecords.length < Math.min(totalCount, maxLimit)) {
-      const nextResp = await fetch(buildUrl(apiUrl, PAGE_SIZE, offset));
-      if (!nextResp.ok) break;
-      const nextJson = await nextResp.json();
+    while ((totalCount === null || allRecords.length < totalCount) && seite <= BK_MAX_SEITEN) {
+      let nextJson;
+      try {
+        nextJson = await fetchOdasJson(
+          buildUrl(apiUrl, PAGE_SIZE, offset),
+          configdata,
+        );
+      } catch (e) {
+        const fehler = e instanceof Error ? e.message : String(e);
+        ladeHinweis =
+          totalCount === null
+            ? `Beim Laden weiterer Seiten trat ein Fehler auf (${fehler}). Kennzahlen, Diagramme, Karte und Tabelle basieren auf dem bisher geladenen Teilbestand.`
+            : `Nur ${allRecords.length.toLocaleString("de-DE")} von ${totalCount.toLocaleString("de-DE")} Bäumen geladen – eine weitere Seite konnte nicht abgerufen werden (${fehler}). Kennzahlen, Diagramme, Karte und Tabelle basieren auf diesem Teilbestand.`;
+        break;
+      }
       const { records: batch } = parseResponse(nextJson);
-      if (!batch || batch.length === 0) break;
+      if (!batch || batch.length === 0) {
+        if (totalCount !== null && allRecords.length < totalCount) {
+          ladeHinweis = `Nur ${allRecords.length.toLocaleString("de-DE")} von ${totalCount.toLocaleString("de-DE")} Bäumen geladen – die Datenquelle lieferte vorzeitig keine weiteren Datensätze. Kennzahlen, Diagramme, Karte und Tabelle basieren auf diesem Teilbestand.`;
+        }
+        break;
+      }
       allRecords = allRecords.concat(batch);
       offset += PAGE_SIZE;
       updateProgress(allRecords.length, totalCount || 0, seite);
       seite++;
     }
 
+    if (seite > BK_MAX_SEITEN && (totalCount === null || allRecords.length < totalCount)) {
+      ladeHinweis =
+        `Mehr als ${(BK_MAX_SEITEN * PAGE_SIZE).toLocaleString("de-DE")} Bäume — der Abruf wurde zum Schutz der Datenquelle begrenzt. Kennzahlen, Diagramme, Karte und Tabelle basieren auf diesem Teilbestand.`;
+    }
+
     updateProgress(allRecords.length, totalCount || 0, seite);
-    return normalizeRecords(allRecords.slice(0, maxLimit));
+    return {
+      records: normalizeRecords(allRecords),
+      freshnessLabel,
+      ladeHinweis,
+    };
+  }
+
+  function extractDatenStand(apiResponse, headerValue) {
+    const raw =
+      headerValue ||
+      apiResponse?.modified ||
+      apiResponse?.last_modified ||
+      apiResponse?.metadata_modified ||
+      apiResponse?.result?.last_modified ||
+      apiResponse?.result?.metadata_modified ||
+      null;
+    if (!raw) return "";
+    const date = new Date(raw);
+    return isNaN(date.getTime()) ? "" : date.toLocaleDateString("de-DE");
   }
 
   function buildUrl(apiUrl, limit, offset) {
@@ -304,7 +788,20 @@ function app(configdata, enclosingHtmlDivElement) {
       }
       return null;
     };
-    const kArtDeutsch = find(
+    const resolveFeld = (configKey, ...aliases) => {
+      const feld = String(configdata[configKey] || "").trim();
+      if (feld) {
+        if (!keys.includes(feld)) {
+          throw new Error(
+            `Konfigurationsfehler: "${configKey}" = "${feld}" – dieses Feld existiert nicht in den geladenen Daten.`,
+          );
+        }
+        return feld;
+      }
+      return find(...aliases);
+    };
+    const kArtDeutsch = resolveFeld(
+      "baumart-feld",
       "artdeutsc",
       "artdeutsch",
       "artname",
@@ -312,12 +809,24 @@ function app(configdata, enclosingHtmlDivElement) {
       "baumart",
     );
     const kArtBotanik = find("artbotani", "botanisch", "latein", "species");
-    const kPflanzjahr = find("pflanzjahr", "pflanzung", "year", "jahr");
-    const kAlter = find("standalter", "alter", "age");
-    const kHoehe = find("baumhoehe", "hoehe", "height");
+    const kPflanzjahr = resolveFeld(
+      "pflanzjahr-feld",
+      "pflanzjahr",
+      "pflanzung",
+      "year",
+      "jahr",
+    );
+    const kAlter = resolveFeld("standalter-feld", "standalter", "alter", "age");
+    const kHoehe = resolveFeld(
+      "baumhoehe-feld",
+      "baumhoehe",
+      "hoehe",
+      "height",
+    );
     const kStamm = find("stammdurch", "stamm", "trunk");
     const kKrone = find("kronendurc", "krone", "crown");
-    const kBezirk = find(
+    const kBezirk = resolveFeld(
+      "stadtbezirk-feld",
       "stadtbezbe",
       "stadtbez",
       "bezirk",
@@ -364,7 +873,13 @@ function app(configdata, enclosingHtmlDivElement) {
   }
 
   // ── RENDERING ────────────────────────────────────────────────────────────
-  function renderApp(allRecords, container, appTitel) {
+  function renderApp(
+    allRecords,
+    container,
+    appTitel,
+    freshnessLabel = "",
+    ladeHinweis = "",
+  ) {
     const bezirke = [
       ...new Set(allRecords.map((r) => r.bezirk).filter(Boolean)),
     ].sort();
@@ -376,25 +891,57 @@ function app(configdata, enclosingHtmlDivElement) {
     const bezirkOptionen = bezirke
       .map((b) => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`)
       .join("");
+    const arten = [
+      ...new Set(allRecords.map((r) => r.artDeutsch).filter(Boolean)),
+    ].sort((a, b) => a.localeCompare(b, "de"));
+    const artOptionen = arten
+      .map((a) => `<option value="${escapeHtml(a)}">${escapeHtml(a)}</option>`)
+      .join("");
+    const pflanzjahre = allRecords
+      .map((r) => r.pflanzjahr)
+      .filter((j) => j !== null && j >= 1800 && j <= 2030);
+    const jahrMin = pflanzjahre.length ? Math.min(...pflanzjahre) : "";
+    const jahrMax = pflanzjahre.length ? Math.max(...pflanzjahre) : "";
 
     container.innerHTML = `
       <h2 class="mb-1">${escapeHtml(appTitel)}</h2>
       <p class="text-muted mb-3">Interaktiver Überblick über den kommunalen Baumbestand${kommuneLabel ? escapeHtml(kommuneLabel) : ""}</p>
+      ${ladeHinweis ? `<div class="alert alert-warning mt-2 mb-0">${escapeHtml(ladeHinweis)}</div>` : ""}
+      ${renderDatenfrische(freshnessLabel)}
       <div class="d-flex flex-wrap align-items-center gap-3 mb-4">
         <div class="d-flex align-items-center gap-2">
-          <label class="form-label fw-semibold mb-0">Stadtbezirk:</label>
-          <select id="bk-bezirk-select" class="form-select form-select-sm" style="width:auto;min-width:180px">
+          <label class="form-label fw-semibold mb-0" for="bk-bezirk-select-${bkUid}">Stadtbezirk:</label>
+          <select id="bk-bezirk-select-${bkUid}" class="form-select form-select-sm" style="width:auto;min-width:180px">
             <option value="">Alle Bezirke</option>
             ${bezirkOptionen}
           </select>
         </div>
         <div class="d-flex align-items-center gap-2">
-          <input type="text" id="bk-search" class="form-control form-control-sm" placeholder="Baumart suchen…" style="width:220px">
+          <label class="form-label fw-semibold mb-0" for="bk-art-select-${bkUid}">Baumart:</label>
+          <select id="bk-art-select-${bkUid}" class="form-select form-select-sm bk-filter-select">
+            <option value="">Alle Arten</option>
+            ${artOptionen}
+          </select>
         </div>
+        <div class="d-flex align-items-center gap-2">
+          <input type="text" id="bk-search-${bkUid}" class="form-control form-control-sm" placeholder="Baumart suchen…" style="width:220px" aria-label="Baumart suchen">
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <label class="form-label fw-semibold mb-0" for="bk-jahr-von-${bkUid}">Pflanzjahr:</label>
+          <input type="number" id="bk-jahr-von-${bkUid}" class="form-control form-control-sm bk-jahr-input" placeholder="${jahrMin}" aria-label="Pflanzjahr von">
+          <span class="text-muted">–</span>
+          <input type="number" id="bk-jahr-bis-${bkUid}" class="form-control form-control-sm bk-jahr-input" placeholder="${jahrMax}" aria-label="Pflanzjahr bis">
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <button id="bk-btn-standort-${bkUid}" type="button" class="btn btn-sm btn-outline-primary">📍 Nächste Bäume</button>
+          <button id="bk-btn-export-${bkUid}" type="button" class="btn btn-sm btn-outline-secondary">CSV-Export</button>
+          <button id="bk-btn-reset-${bkUid}" type="button" class="btn btn-sm btn-outline-secondary">Zurücksetzen</button>
+        </div>
+        <div id="bk-geo-status-${bkUid}" class="small text-muted w-100" role="status"></div>
       </div>
 
       <!-- KPI-Kacheln -->
-      <div id="bk-kpis" class="row g-3 mb-4"></div>
+      <div id="bk-kpis-${bkUid}" class="row g-3 mb-4"></div>
 
       <!-- Charts -->
       <div class="row g-4 mb-4">
@@ -403,7 +950,7 @@ function app(configdata, enclosingHtmlDivElement) {
             <div class="card-body">
               <h6 class="card-title fw-semibold">Top-15 Baumarten</h6>
               <div style="position:relative;max-height:340px">
-                <canvas id="bk-chart-arten" style="max-height:320px"></canvas>
+                <canvas id="bk-chart-arten-${bkUid}" style="max-height:320px"></canvas>
               </div>
             </div>
           </div>
@@ -413,7 +960,7 @@ function app(configdata, enclosingHtmlDivElement) {
             <div class="card-body">
               <h6 class="card-title fw-semibold">Pflanzungen pro Jahrzehnt</h6>
               <div style="position:relative;max-height:340px">
-                <canvas id="bk-chart-jahrzehnte" style="max-height:320px"></canvas>
+                <canvas id="bk-chart-jahrzehnte-${bkUid}" style="max-height:320px"></canvas>
               </div>
             </div>
           </div>
@@ -425,7 +972,7 @@ function app(configdata, enclosingHtmlDivElement) {
         <div class="card-body">
           <h6 class="card-title fw-semibold">Altersverteilung (Pflanzjahr-Histogramm)</h6>
           <div style="position:relative;max-height:200px">
-            <canvas id="bk-chart-alter" style="max-height:180px"></canvas>
+            <canvas id="bk-chart-alter-${bkUid}" style="max-height:180px"></canvas>
           </div>
         </div>
       </div>
@@ -436,11 +983,11 @@ function app(configdata, enclosingHtmlDivElement) {
           <div class="d-flex justify-content-between align-items-center mb-2">
             <h6 class="card-title fw-semibold mb-0">Baumstandorte</h6>
             <div class="btn-group btn-group-sm" role="group">
-              <button id="bk-map-heatmap" class="btn btn-primary btn-sm">Heatmap</button>
-              <button id="bk-map-punkte" class="btn btn-outline-secondary btn-sm">Einzelpunkte</button>
+              <button id="bk-map-heatmap-${bkUid}" class="btn btn-primary btn-sm">Heatmap</button>
+              <button id="bk-map-punkte-${bkUid}" class="btn btn-outline-secondary btn-sm">Einzelpunkte</button>
             </div>
           </div>
-          <div id="bk-karte" style="height:480px; border-radius:8px; z-index:0;"></div>
+          <div id="bk-karte-${bkUid}" style="height:480px; border-radius:8px; z-index:0;"></div>
         </div>
       </div>
 
@@ -449,7 +996,7 @@ function app(configdata, enclosingHtmlDivElement) {
         <div class="card-body p-0">
           <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
             <span class="fw-semibold">Detailtabelle</span>
-            <span id="bk-table-count" class="badge bg-secondary"></span>
+            <span id="bk-table-count-${bkUid}" class="badge bg-secondary"></span>
           </div>
           <div style="max-height:420px;overflow-y:auto">
             <table class="table table-sm table-hover mb-0">
@@ -460,16 +1007,24 @@ function app(configdata, enclosingHtmlDivElement) {
                   <th>Krone m</th><th>Stadtbezirk</th>
                 </tr>
               </thead>
-              <tbody id="bk-table-body"></tbody>
+              <tbody id="bk-table-body-${bkUid}"></tbody>
             </table>
           </div>
         </div>
       </div>
+
+      ${renderMethodikbox(configdata)}
+      ${renderWeitereInfos(configdata)}
     `;
 
     // State
     let currentBezirk = "";
     let currentSearch = "";
+    let currentArt = "";
+    let jahrVon = null;
+    let jahrBis = null;
+    let umkreisMitte = null; // { lat, lon } oder null (Umkreissuche aktiv)
+    let standortMarker = null;
     let sortCol = null; // aktuell sortierte Spalte (Feldname als String)
     let sortDir = "asc"; // 'asc' oder 'desc'
     let artenChart = null,
@@ -479,6 +1034,35 @@ function app(configdata, enclosingHtmlDivElement) {
     let heatLayer = null;
     let punkteLayer = null;
     let karteInitialisiert = false;
+    // F-57: Teardown früh registrieren, sobald die Ressourcenclosure existiert —
+    // nicht erst im Leaflet-Init-Callback. Räumt Charts und Karte ab und
+    // blockiert über den geteilten disposed-State späte Fortsetzungen.
+    // BK-B1-Hinweis: hier bewusst ÜBERSCHREIBEN ohne Ausführen — der
+    // ersetzte Eintrag ist immer der eigene app()-Top-Eintrag (Fremd-Einträge
+    // wurden dort bereits konsumiert); Ausführen würde das eigene disposed
+    // setzen und diese Instanz stilllegen.
+    baumTeardowns.set(enclosingHtmlDivElement, function () {
+      disposed = true;
+      try {
+        if (artenChart) artenChart.destroy();
+        if (jahrzehnteChart) jahrzehnteChart.destroy();
+        if (alterChart) alterChart.destroy();
+      } catch (error) {
+        console.warn("Fehler beim Abraeumen der Baumkataster-Charts:", error);
+      }
+      artenChart = null;
+      jahrzehnteChart = null;
+      alterChart = null;
+      try {
+        if (leafletMap) leafletMap.remove();
+      } catch (error) {
+        console.warn("Fehler beim Entfernen der Leaflet-Karte:", error);
+      }
+      leafletMap = null;
+      heatLayer = null;
+      punkteLayer = null;
+      karteInitialisiert = false;
+    });
     function renderKarte(records) {
       // Nur Datensätze mit gültigen Koordinaten
       const mitGeo = records.filter(
@@ -486,11 +1070,27 @@ function app(configdata, enclosingHtmlDivElement) {
       );
       if (mitGeo.length === 0) return;
 
-      const mapEl = document.getElementById("bk-karte");
+      const mapEl = container.querySelector("#bk-karte-" + bkUid);
       if (!mapEl) return;
 
+      // Falls die Karte bereits existiert, prüfen wir, ob sie an ein altes/gelöschtes DOM-Element gebunden ist
+      if (leafletMap) {
+        const oldContainer = leafletMap.getContainer();
+        if (oldContainer !== mapEl) {
+          // DOM-Element hat sich geändert. Alte Karte abbauen, um neu zu initialisieren.
+          try {
+            leafletMap.remove();
+          } catch (e) {
+            console.warn("Fehler beim Entfernen der alten Leaflet-Karte:", e);
+          }
+          leafletMap = null;
+          heatLayer = null;
+          punkteLayer = null;
+        }
+      }
+
       // Karte und Layer nur einmal initialisieren
-      if (!window._bk_leafletMap) {
+      if (!leafletMap) {
         function ladeLeaflet(callback) {
           if (window.L) {
             callback();
@@ -498,15 +1098,15 @@ function app(configdata, enclosingHtmlDivElement) {
           }
           const css = document.createElement("link");
           css.rel = "stylesheet";
-          css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+          css.href = "vendor/leaflet/leaflet.css";
           document.head.appendChild(css);
 
           const script = document.createElement("script");
-          script.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+          script.src = "vendor/leaflet/leaflet.js";
           script.onload = () => {
             const heat = document.createElement("script");
             heat.src =
-              "https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js";
+              "vendor/leafletheat/leaflet-heat.js";
             heat.onload = callback;
             document.head.appendChild(heat);
           };
@@ -514,28 +1114,29 @@ function app(configdata, enclosingHtmlDivElement) {
         }
 
         ladeLeaflet(() => {
+          if (disposed) return;
           // Karte erstellen
           const center = [mitGeo[0].lat, mitGeo[0].lon];
-          window._bk_leafletMap = L.map("bk-karte").setView(center, 12);
+          leafletMap = L.map(root.querySelector("#bk-karte-" + bkUid)).setView(center, 12);
 
           L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
             attribution:
               '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
             maxZoom: 19,
-          }).addTo(window._bk_leafletMap);
+          }).addTo(leafletMap);
 
-          window._bk_heatLayer = null;
-          window._bk_punkteLayer = null;
+          heatLayer = null;
+          punkteLayer = null;
 
           // Buttons initialisieren (nur einmal!)
-          const btnHeat = document.getElementById("bk-map-heatmap");
-          const btnPunkte = document.getElementById("bk-map-punkte");
+          const btnHeat = container.querySelector("#bk-map-heatmap-" + bkUid);
+          const btnPunkte = container.querySelector("#bk-map-punkte-" + bkUid);
 
           btnHeat.replaceWith(btnHeat.cloneNode(true));
           btnPunkte.replaceWith(btnPunkte.cloneNode(true));
 
-          const btnHeatNew = document.getElementById("bk-map-heatmap");
-          const btnPunkteNew = document.getElementById("bk-map-punkte");
+          const btnHeatNew = container.querySelector("#bk-map-heatmap-" + bkUid);
+          const btnPunkteNew = container.querySelector("#bk-map-punkte-" + bkUid);
 
           btnHeatNew.addEventListener("click", () => {
             zeigeHeatmap(mitGeo);
@@ -557,16 +1158,16 @@ function app(configdata, enclosingHtmlDivElement) {
       } else {
         // Karte existiert schon, nur Layer aktualisieren
         zeigeHeatmap(mitGeo);
-        const btnHeat = document.getElementById("bk-map-heatmap");
-        const btnPunkte = document.getElementById("bk-map-punkte");
+        const btnHeat = container.querySelector("#bk-map-heatmap-" + bkUid);
+        const btnPunkte = container.querySelector("#bk-map-punkte-" + bkUid);
         if (btnHeat && btnPunkte) {
           btnHeat.className = "btn btn-primary btn-sm";
           btnPunkte.className = "btn btn-outline-secondary btn-sm";
         }
         btnHeat.replaceWith(btnHeat.cloneNode(true));
         btnPunkte.replaceWith(btnPunkte.cloneNode(true));
-        const btnHeatNew = document.getElementById("bk-map-heatmap");
-        const btnPunkteNew = document.getElementById("bk-map-punkte");
+        const btnHeatNew = container.querySelector("#bk-map-heatmap-" + bkUid);
+        const btnPunkteNew = container.querySelector("#bk-map-punkte-" + bkUid);
         btnHeatNew.addEventListener("click", () => {
           zeigeHeatmap(mitGeo);
           btnHeatNew.className = "btn btn-primary btn-sm";
@@ -580,18 +1181,18 @@ function app(configdata, enclosingHtmlDivElement) {
       }
 
       function zeigeHeatmap(mitGeo) {
-        const map = window._bk_leafletMap;
+        const map = leafletMap;
         if (!map) return;
-        if (window._bk_punkteLayer) {
-          map.removeLayer(window._bk_punkteLayer);
-          window._bk_punkteLayer = null;
+        if (punkteLayer) {
+          map.removeLayer(punkteLayer);
+          punkteLayer = null;
         }
-        if (window._bk_heatLayer) {
-          map.removeLayer(window._bk_heatLayer);
-          window._bk_heatLayer = null;
+        if (heatLayer) {
+          map.removeLayer(heatLayer);
+          heatLayer = null;
         }
         const heatData = mitGeo.map((r) => [r.lat, r.lon, 0.5]);
-        window._bk_heatLayer = L.heatLayer(heatData, {
+        heatLayer = L.heatLayer(heatData, {
           radius: 10,
           blur: 8,
           maxZoom: 17,
@@ -602,25 +1203,25 @@ function app(configdata, enclosingHtmlDivElement) {
             1.0: "#b71c1c",
           },
         }).addTo(map);
-        const bounds = L.latLngBounds(
-          mitGeo.slice(0, 1000).map((r) => [r.lat, r.lon]),
-        );
+        // Bounds über ALLE Punkte (inkrementell — kein Riesen-Array).
+        const bounds = L.latLngBounds();
+        mitGeo.forEach((r) => bounds.extend([r.lat, r.lon]));
         map.fitBounds(bounds, { padding: [20, 20] });
       }
 
       function zeigePunkte(mitGeo) {
-        const map = window._bk_leafletMap;
+        const map = leafletMap;
         if (!map) return;
-        if (window._bk_heatLayer) {
-          map.removeLayer(window._bk_heatLayer);
-          window._bk_heatLayer = null;
+        if (heatLayer) {
+          map.removeLayer(heatLayer);
+          heatLayer = null;
         }
-        if (window._bk_punkteLayer) {
-          map.removeLayer(window._bk_punkteLayer);
-          window._bk_punkteLayer = null;
+        if (punkteLayer) {
+          map.removeLayer(punkteLayer);
+          punkteLayer = null;
         }
         const renderer = L.canvas({ padding: 0.5 });
-        window._bk_punkteLayer = L.layerGroup();
+        punkteLayer = L.layerGroup();
         mitGeo.forEach((r) => {
           L.circleMarker([r.lat, r.lon], {
             renderer,
@@ -639,28 +1240,21 @@ function app(configdata, enclosingHtmlDivElement) {
                 Bezirk: ${escapeHtml(r.bezirk)}
               `,
             )
-            .addTo(window._bk_punkteLayer);
+            .addTo(punkteLayer);
         });
-        window._bk_punkteLayer.addTo(map);
-        const bounds = L.latLngBounds(
-          mitGeo.slice(0, 1000).map((r) => [r.lat, r.lon]),
-        );
+        punkteLayer.addTo(map);
+        const bounds = L.latLngBounds();
+        mitGeo.forEach((r) => bounds.extend([r.lat, r.lon]));
         map.fitBounds(bounds, { padding: [20, 20] });
-      }
-
-      function escapeHtml(str) {
-        return String(str)
-          .replace(/&/g, "&amp;")
-          .replace(/</g, "&lt;")
-          .replace(/>/g, "&gt;")
-          .replace(/"/g, "&quot;")
-          .replace(/'/g, "&#039;");
       }
     }
 
     function getFiltered() {
       return allRecords.filter((r) => {
         if (currentBezirk && r.bezirk !== currentBezirk) return false;
+        if (currentArt && r.artDeutsch !== currentArt) return false;
+        if (jahrVon !== null && (r.pflanzjahr === null || r.pflanzjahr < jahrVon)) return false;
+        if (jahrBis !== null && (r.pflanzjahr === null || r.pflanzjahr > jahrBis)) return false;
         if (currentSearch) {
           const s = currentSearch.toLowerCase();
           if (
@@ -689,31 +1283,43 @@ function app(configdata, enclosingHtmlDivElement) {
           )
         : "–";
       const anzBezirke = new Set(records.map((r) => r.bezirk)).size;
-      const kpiEl = document.getElementById("bk-kpis");
+      const kpiEl = container.querySelector("#bk-kpis-" + bkUid);
       if (!kpiEl) return;
+      const kk = (n) => {
+        const t = String(configdata["kpiKontext" + n] || "").trim();
+        if (!t) return "";
+        return (
+          '<button class="bk-kpi-info-toggle collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#bk-kpi-kontext-' + n + '-' + bkUid + '" aria-expanded="false" aria-controls="bk-kpi-kontext-' + n + '-' + bkUid + '" aria-label="Erklärung zu diesem Wert"><span class="bk-kpi-info-icon" aria-hidden="true">ⓘ</span></button>' +
+          '<div id="bk-kpi-kontext-' + n + '-' + bkUid + '" class="collapse"><div class="bk-kpi-kontext text-muted small">' + escapeHtml(t) + "</div></div>"
+        );
+      };
       kpiEl.innerHTML = `
         <div class="col-6 col-md-3">
           <div class="card border-success h-100"><div class="card-body text-center py-3">
             <div class="fs-3 fw-bold text-success">${total.toLocaleString("de-DE")}</div>
             <div class="text-muted small">Bäume gesamt</div>
+            ${kk(1)}
           </div></div>
         </div>
         <div class="col-6 col-md-3">
           <div class="card border-info h-100"><div class="card-body text-center py-3">
             <div class="fs-3 fw-bold text-info">${avgAlter} J.</div>
             <div class="text-muted small">Ø Baumalter</div>
+            ${kk(2)}
           </div></div>
         </div>
         <div class="col-6 col-md-3">
           <div class="card border-warning h-100"><div class="card-body text-center py-3">
             <div class="fs-3 fw-bold text-warning">${avgHoehe} m</div>
             <div class="text-muted small">Ø Baumhöhe</div>
+            ${kk(3)}
           </div></div>
         </div>
         <div class="col-6 col-md-3">
           <div class="card border-secondary h-100"><div class="card-body text-center py-3">
             <div class="fs-3 fw-bold">${anzBezirke}</div>
             <div class="text-muted small">Stadtbezirke</div>
+            ${kk(4)}
           </div></div>
         </div>
       `;
@@ -730,7 +1336,7 @@ function app(configdata, enclosingHtmlDivElement) {
         .slice(0, 15);
       const labels = sorted.map(([k]) => kuerze(k, 30));
       const data = sorted.map(([, v]) => v);
-      const ctx = document.getElementById("bk-chart-arten");
+      const ctx = container.querySelector("#bk-chart-arten-" + bkUid);
       if (!ctx) return;
       if (artenChart) artenChart.destroy();
       artenChart = new Chart(ctx, {
@@ -777,7 +1383,7 @@ function app(configdata, enclosingHtmlDivElement) {
       const sorted = [...map.entries()].sort((a, b) => a[0] - b[0]);
       const labels = sorted.map(([k]) => `${k}er`);
       const data = sorted.map(([, v]) => v);
-      const ctx = document.getElementById("bk-chart-jahrzehnte");
+      const ctx = container.querySelector("#bk-chart-jahrzehnte-" + bkUid);
       if (!ctx) return;
       if (jahrzehnteChart) jahrzehnteChart.destroy();
       jahrzehnteChart = new Chart(ctx, {
@@ -826,7 +1432,7 @@ function app(configdata, enclosingHtmlDivElement) {
       );
       const labels = sorted.map(([k]) => `${k}–${Number(k) + step - 1} J.`);
       const data = sorted.map(([, v]) => v);
-      const ctx = document.getElementById("bk-chart-alter");
+      const ctx = container.querySelector("#bk-chart-alter-" + bkUid);
       if (!ctx) return;
       if (alterChart) alterChart.destroy();
       alterChart = new Chart(ctx, {
@@ -863,8 +1469,8 @@ function app(configdata, enclosingHtmlDivElement) {
     }
 
     function renderTabelle(records) {
-      const tbody = document.getElementById("bk-table-body");
-      const countEl = document.getElementById("bk-table-count");
+      const tbody = container.querySelector("#bk-table-body-" + bkUid);
+      const countEl = container.querySelector("#bk-table-count-" + bkUid);
       if (!tbody) return;
 
       // Sortierung anwenden
@@ -883,9 +1489,26 @@ function app(configdata, enclosingHtmlDivElement) {
         });
       }
 
+      // Umkreissuche: Entfernung berechnen und danach sortieren (schlägt die
+      // Spaltensortierung — Nähe ist in diesem Modus das Sortierkriterium).
+      const mitDistanz = umkreisMitte !== null;
+      if (mitDistanz) {
+        sorted.forEach((r) => {
+          r._dist =
+            r.lat != null && r.lon != null && !isNaN(Number(r.lat)) && !isNaN(Number(r.lon))
+              ? bkHaversineKm(umkreisMitte.lat, umkreisMitte.lon, Number(r.lat), Number(r.lon))
+              : null;
+        });
+        sorted.sort(
+          (a, b) =>
+            (a._dist === null ? 1 : 0) - (b._dist === null ? 1 : 0) ||
+            (a._dist ?? 0) - (b._dist ?? 0),
+        );
+      }
+
       const anzeige = sorted.slice(0, 500);
       if (countEl)
-        countEl.textContent = `${records.length.toLocaleString("de-DE")} Bäume${records.length > 500 ? " · Top 500" : ""}`;
+        countEl.textContent = `${records.length.toLocaleString("de-DE")} Bäume${records.length > 500 ? " · Top 500" : ""}${mitDistanz ? " · nach Entfernung" : ""}`;
 
       // Pfeil-Icon je nach Sortierzustand
       const pfeil = (col) => {
@@ -897,8 +1520,8 @@ function app(configdata, enclosingHtmlDivElement) {
       };
 
       // Tabellenkopf mit klickbaren Spalten neu rendern
-      const thead = document
-        .querySelector("#bk-table-body")
+      const thead = container
+        .querySelector("#bk-table-body-" + bkUid)
         ?.closest("table")
         ?.querySelector("thead tr");
       if (thead) {
@@ -912,10 +1535,14 @@ function app(configdata, enclosingHtmlDivElement) {
           { key: "krone", label: "Krone m" },
           { key: "bezirk", label: "Stadtbezirk" },
         ];
+        if (mitDistanz) cols.push({ key: "_dist", label: "Entfernung", nosort: true });
         thead.innerHTML = cols
           .map(
-            (c) => `
-          <th style="cursor:pointer;white-space:nowrap;user-select:none;" 
+            (c) =>
+              c.nosort
+                ? `<th>${c.label}</th>`
+                : `
+          <th style="cursor:pointer;white-space:nowrap;user-select:none;"
               data-col="${c.key}">
             ${c.label}${pfeil(c.key)}
           </th>
@@ -940,7 +1567,7 @@ function app(configdata, enclosingHtmlDivElement) {
 
       // Tabelleninhalt rendern
       if (anzeige.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-3">
+        tbody.innerHTML = `<tr><td colspan="${mitDistanz ? 9 : 8}" class="text-center text-muted py-3">
       Keine Bäume für die aktuelle Auswahl.</td></tr>`;
         return;
       }
@@ -956,7 +1583,7 @@ function app(configdata, enclosingHtmlDivElement) {
           <td>${r.hoehe !== null ? r.hoehe.toFixed(1) : ""}</td>
           <td>${r.stamm !== null ? r.stamm : ""}</td>
           <td>${r.krone !== null ? r.krone.toFixed(2) : ""}</td>
-          <td>${escapeHtml(r.bezirk)}</td>
+          <td>${escapeHtml(r.bezirk)}</td>${mitDistanz ? `<td>${r._dist != null ? r._dist.toFixed(1) + " km" : "–"}</td>` : ""}
         </tr>
       `,
         )
@@ -964,6 +1591,8 @@ function app(configdata, enclosingHtmlDivElement) {
     }
 
     function updateAll() {
+      // Entprellte Filter können nach einem Seitenwechsel feuern.
+      if (disposed) return;
       const records = getFiltered();
       renderKpis(records);
       renderArtenChart(records);
@@ -973,15 +1602,157 @@ function app(configdata, enclosingHtmlDivElement) {
       renderTabelle(records);
     }
 
+    const setzeGeoStatus = (text) => {
+      const el = container.querySelector("#bk-geo-status-" + bkUid);
+      if (el) el.textContent = text;
+    };
+
+    const schalteUmkreisAb = () => {
+      umkreisMitte = null;
+      if (standortMarker && leafletMap) {
+        try {
+          leafletMap.removeLayer(standortMarker);
+        } catch (_e) {}
+      }
+      standortMarker = null;
+      const b = container.querySelector("#bk-btn-standort-" + bkUid);
+      if (b) b.textContent = "📍 Nächste Bäume";
+      setzeGeoStatus("");
+    };
+
     // Event-Listener
-    document
-      .getElementById("bk-bezirk-select")
+    container
+      .querySelector("#bk-bezirk-select-" + bkUid)
       ?.addEventListener("change", (e) => {
         currentBezirk = e.target.value;
         updateAll();
       });
-    document.getElementById("bk-search")?.addEventListener("input", (e) => {
+    container
+      .querySelector("#bk-art-select-" + bkUid)
+      ?.addEventListener("change", (e) => {
+        currentArt = e.target.value;
+        updateAll();
+      });
+    const leseJahrFilter = () => {
+      const vonEl = container.querySelector("#bk-jahr-von-" + bkUid);
+      const bisEl = container.querySelector("#bk-jahr-bis-" + bkUid);
+      const von = vonEl ? parseInt(vonEl.value, 10) : NaN;
+      const bis = bisEl ? parseInt(bisEl.value, 10) : NaN;
+      jahrVon = Number.isNaN(von) ? null : von;
+      jahrBis = Number.isNaN(bis) ? null : bis;
+    };
+    const jahrGeaendert = bkEntprellt(() => {
+      if (disposed) return;
+      leseJahrFilter();
+      updateAll();
+    }, 250);
+    container.querySelector("#bk-jahr-von-" + bkUid)?.addEventListener("input", jahrGeaendert);
+    container.querySelector("#bk-jahr-bis-" + bkUid)?.addEventListener("input", jahrGeaendert);
+    container.querySelector("#bk-search-" + bkUid)?.addEventListener("input", bkEntprellt((e) => {
+      if (disposed) return;
       currentSearch = e.target.value.trim();
+      updateAll();
+    }, 250));
+    container.querySelector("#bk-btn-standort-" + bkUid)?.addEventListener("click", () => {
+      if (disposed) return;
+      if (umkreisMitte) {
+        schalteUmkreisAb();
+        updateAll();
+        return;
+      }
+      if (!navigator.geolocation) {
+        setzeGeoStatus("Geolocation wird von diesem Browser nicht unterstützt.");
+        return;
+      }
+      const btn = container.querySelector("#bk-btn-standort-" + bkUid);
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "📍 Ort wird bestimmt…";
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          if (disposed) return;
+          umkreisMitte = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+          if (standortMarker && leafletMap) {
+            try {
+              leafletMap.removeLayer(standortMarker);
+            } catch (_e) {}
+          }
+          standortMarker = null;
+          if (leafletMap && window.L) {
+            try {
+              standortMarker = L.marker([umkreisMitte.lat, umkreisMitte.lon]).addTo(leafletMap);
+              if (standortMarker.bindPopup) standortMarker.bindPopup("Ihr Standort");
+              leafletMap.setView([umkreisMitte.lat, umkreisMitte.lon], 14);
+            } catch (_e) {}
+          }
+          const b = container.querySelector("#bk-btn-standort-" + bkUid);
+          if (b) {
+            b.disabled = false;
+            b.textContent = "📍 Umkreis aktiv — ausschalten?";
+          }
+          setzeGeoStatus("Tabelle nach Entfernung zu Ihrem Standort sortiert.");
+          updateAll();
+        },
+        (fehler) => {
+          if (disposed) return;
+          const b = container.querySelector("#bk-btn-standort-" + bkUid);
+          if (b) {
+            b.disabled = false;
+            b.textContent = "📍 Nächste Bäume";
+          }
+          setzeGeoStatus(
+            fehler && fehler.code === 1
+              ? "Standortzugriff verweigert — bitte im Browser freigeben."
+              : "Standort konnte nicht bestimmt werden.",
+          );
+        },
+        { timeout: 10000 },
+      );
+    });
+    container.querySelector("#bk-btn-export-" + bkUid)?.addEventListener("click", () => {
+      if (disposed) return;
+      const daten = getFiltered();
+      const esc = (v) => {
+        const s = String(v ?? "");
+        return /[";\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      };
+      const zeilen = ["Baumart deutsch;Botanisch;Pflanzjahr;Alter J.;Höhe m;Stamm cm;Krone m;Stadtbezirk"];
+      daten.forEach((r) => {
+        zeilen.push(
+          [r.artDeutsch, r.artBotanik, r.pflanzjahr ?? "", r.alter ?? "", r.hoehe ?? "", r.stamm ?? "", r.krone ?? "", r.bezirk]
+            .map(esc)
+            .join(";"),
+        );
+      });
+      const blob = new Blob(["\uFEFF" + zeilen.join("\r\n")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "baumkataster-export.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+    container.querySelector("#bk-btn-reset-" + bkUid)?.addEventListener("click", () => {
+      if (disposed) return;
+      currentBezirk = "";
+      currentArt = "";
+      currentSearch = "";
+      jahrVon = null;
+      jahrBis = null;
+      schalteUmkreisAb();
+      const selBezirk = container.querySelector("#bk-bezirk-select-" + bkUid);
+      if (selBezirk) selBezirk.value = "";
+      const selArt = container.querySelector("#bk-art-select-" + bkUid);
+      if (selArt) selArt.value = "";
+      const suche = container.querySelector("#bk-search-" + bkUid);
+      if (suche) suche.value = "";
+      const vonEl = container.querySelector("#bk-jahr-von-" + bkUid);
+      if (vonEl) vonEl.value = "";
+      const bisEl = container.querySelector("#bk-jahr-bis-" + bkUid);
+      if (bisEl) bisEl.value = "";
       updateAll();
     });
 
@@ -990,6 +1761,28 @@ function app(configdata, enclosingHtmlDivElement) {
   }
 
   // ── HILFSFUNKTIONEN ──────────────────────────────────────────────────────
+  // Suche entprellen: jeder Tastenschlag baut sonst 3 Charts + Kartenlayer
+  // neu auf (bei 10k+ Bäumen spürbar).
+  function bkEntprellt(fn, millis) {
+    let timer = null;
+    return function (...args) {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        fn.apply(this, args);
+      }, millis);
+    };
+  }
+
+  // Haversine-Distanz in km (Umkreissuche).
+  function bkHaversineKm(lat1, lon1, lat2, lon2) {
+    const rad = (d) => (d * Math.PI) / 180;
+    const a =
+      Math.sin(rad(lat2 - lat1) / 2) ** 2 +
+      Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
+    return 2 * 6371 * Math.asin(Math.sqrt(a));
+  }
+
   function kuerze(str, maxLen) {
     if (!str) return "";
     return str.length <= maxLen ? str : str.slice(0, maxLen - 1) + "…";
@@ -1004,52 +1797,77 @@ function app(configdata, enclosingHtmlDivElement) {
       .replace(/'/g, "&#039;");
   }
 
-  function parseCsv(text) {
-    const lines = text
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .split("\n")
-      .filter((l) => l.trim());
-    if (lines.length < 2) throw new Error("CSV enthält zu wenig Zeilen.");
-    const sep = lines[0].includes(";") ? ";" : ",";
-    const headers = splitCsvLine(lines[0], sep).map((h) =>
-      h.trim().replace(/^"|"$/g, ""),
+  function renderWeitereInfos(cfg) {
+    const links = String((cfg && cfg.weiterfuehrendeLinks) || "").trim();
+    if (!links) return "";
+    return (
+      '<section class="bk-weitere-infos card border-secondary mt-4"><div class="card-body">' +
+      '<h6 class="card-title fw-semibold">Weitere Informationen</h6>' +
+      '<div class="bk-weitere-infos-content">' +
+      links +
+      "</div></div></section>"
     );
-    const records = [];
-    for (let i = 1; i < lines.length; i++) {
-      const vals = splitCsvLine(lines[i], sep);
-      if (vals.length < 2) continue;
-      const obj = {};
-      headers.forEach((h, idx) => {
-        obj[h] = (vals[idx] || "").trim().replace(/^"|"$/g, "");
-      });
-      records.push(obj);
-    }
-    return normalizeRecords(records);
   }
 
-  function splitCsvLine(line, sep) {
-    const result = [];
-    let cur = "";
-    let inQuote = false;
-    for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (c === '"') {
-        inQuote = !inQuote;
-      } else if (c === sep && !inQuote) {
-        result.push(cur);
-        cur = "";
-      } else {
-        cur += c;
-      }
+  function renderDatenfrische(freshnessLabel) {
+    const label = String(freshnessLabel || "").trim();
+    if (!label) return "";
+    return (
+      '<div class="bk-datenfrische text-muted small text-end mb-2">' +
+      "Aktualisiert: " +
+      escapeHtml(label) +
+      "</div>"
+    );
+  }
+
+  function renderMethodikbox(cfg) {
+    const hinweis = String((cfg && cfg.datenquelleHinweis) || "").trim();
+    const stand = String((cfg && cfg.datenStand) || "").trim();
+    if (!hinweis && !stand) return "";
+    const standHtml = stand
+      ? '<p class="text-muted small mb-2">' + escapeHtml(stand) + "</p>"
+      : "";
+    return (
+      '<div class="card border-secondary mt-4"><div class="card-body">' +
+      '<button class="bk-methodik-toggle btn btn-link text-decoration-none d-flex w-100 justify-content-between align-items-center p-0 collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#bk-methodik-body-' + bkUid + '" aria-expanded="false" aria-controls="bk-methodik-body-' + bkUid + '">' +
+      '<h6 class="card-title fw-semibold mb-0">Methodik &amp; Datenquelle</h6>' +
+      '<span class="bk-methodik-chevron" aria-hidden="true">&#9662;</span>' +
+      "</button>" +
+      '<div id="bk-methodik-body-' + bkUid + '" class="collapse mt-2">' +
+      standHtml +
+      hinweis +
+      "</div>" +
+      "</div></div>"
+    );
+  }
+
+  // ── CSV-PARSEN (PapaParse, RFC 4180; Delimiter-Auto-Detect) ────────────
+  function parseCsv(text) {
+    const result = Papa.parse(text, {
+      header: true,
+      skipEmptyLines: "greedy",
+      transformHeader: (h) => h.trim(),
+    });
+    if (result.errors && result.errors.length > 0) {
+      const err = result.errors[0];
+      throw new Error(
+        `CSV-Parsing-Fehler (Zeile ${err.row + 1}): ${err.message}`,
+      );
     }
-    result.push(cur);
-    return result;
+    if (!result.data.length) throw new Error("CSV enthält zu wenig Zeilen.");
+    const records = result.data.map((row) => {
+      const obj = {};
+      Object.keys(row).forEach((h) => {
+        obj[h] = typeof row[h] === "string" ? row[h].trim() : row[h];
+      });
+      return obj;
+    });
+    return normalizeRecords(records);
   }
 } // Ende app()
 
 // ── BIBLIOTHEKEN LADEN ───────────────────────────────────────────────────────
 function addToHead() {
   // Wird nicht mehr benötigt – Chart.js wird dynamisch per ensureChartJsLoaded() geladen.
-  return;
+  return ``;
 }
